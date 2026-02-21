@@ -6,7 +6,9 @@ mod auth;
 mod context;
 mod meta_commands;
 mod query;
+mod table_renderer;
 mod utils;
+mod viewer;
 
 use args::get_args;
 use auth::maybe_authenticate;
@@ -14,6 +16,7 @@ use context::Context;
 use meta_commands::handle_meta_command;
 use query::{query, try_split_queries};
 use utils::history_path;
+use viewer::open_csvlens_viewer;
 
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const USER_AGENT: &str = concat!("fdb-cli/", env!("CARGO_PKG_VERSION"));
@@ -43,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let is_tty = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    context.is_interactive = is_tty;
 
     let mut rl = DefaultEditor::new()?;
     let history_path = history_path()?;
@@ -57,8 +61,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     rl.bind_sequence(KeyEvent(KeyCode::Char('o'), Modifiers::CTRL), EventHandler::Simple(Cmd::Newline));
 
-    if is_tty {
-        eprintln!("Press Ctrl+D to exit.");
+    // Bind Ctrl-V to trigger viewer via special marker
+    // Using Cmd::AcceptLine alone won't work because we need to detect it was Ctrl-V
+    // Instead, we'll keep the two-step approach (Ctrl-V + Enter) which is explicit and clear
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Char('v'), Modifiers::CTRL),
+        EventHandler::Simple(Cmd::Insert(1, "\\view".to_string()))
+    );
+
+    if is_tty && !context.args.concise {
+        eprintln!("Type \\help for available commands or press Ctrl+V then Enter to view last result. Ctrl+D to exit.");
     }
     let mut buffer: String = String::new();
     let mut has_error = false;
@@ -92,6 +104,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match readline {
             Ok(line) => {
+                // Check for special commands
+                let trimmed = line.trim();
+
+                if trimmed == "\\view" {
+                    // Open csvlens viewer for last query result
+                    if let Err(e) = open_csvlens_viewer(&context) {
+                        eprintln!("Failed to open viewer: {}", e);
+                    }
+                    continue;
+                } else if trimmed == "\\help" {
+                    // Show help for special commands
+                    eprintln!("Special commands:");
+                    eprintln!("  \\view       - Open last query result in csvlens viewer");
+                    eprintln!("                (requires client format: client:auto, client:vertical, or client:horizontal)");
+                    eprintln!("  \\help       - Show this help message");
+                    eprintln!();
+                    eprintln!("SQL-style commands:");
+                    eprintln!("  set format = <value>;   - Change output format");
+                    eprintln!("  unset format;           - Reset format to default");
+                    eprintln!();
+                    eprintln!("Format values:");
+                    eprintln!("  Client-side rendering (prefix with 'client:'):");
+                    eprintln!("    client:auto       - Smart switching between horizontal/vertical (default in interactive)");
+                    eprintln!("    client:horizontal - Force horizontal table layout");
+                    eprintln!("    client:vertical   - Force vertical two-column layout");
+                    eprintln!();
+                    eprintln!("  Server-side rendering (no prefix):");
+                    eprintln!("    PSQL              - PostgreSQL-style format (default in non-interactive)");
+                    eprintln!("    JSON              - JSON format");
+                    eprintln!("    CSV               - CSV format");
+                    eprintln!("    TabSeparatedWithNames    - TSV with headers");
+                    eprintln!("    JSONLines_Compact        - JSON Lines format");
+                    eprintln!();
+                    eprintln!("Examples:");
+                    eprintln!("  set format = client:vertical;  # Use client-side vertical display");
+                    eprintln!("  set format = JSON;             # Use server-side JSON output");
+                    eprintln!();
+                    eprintln!("Keyboard shortcuts:");
+                    eprintln!("  Ctrl+V then Enter - Open last query result in csvlens viewer (inserts \\view)");
+                    eprintln!("  Ctrl+O            - Insert newline (for multi-line queries)");
+                    eprintln!("  Ctrl+D            - Exit REPL");
+                    eprintln!("  Ctrl+C            - Cancel current input");
+                    continue;
+                }
+
                 buffer += line.as_str();
 
                 if buffer.trim() == "quit" || buffer.trim() == "exit" {

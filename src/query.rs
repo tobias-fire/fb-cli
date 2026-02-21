@@ -9,9 +9,85 @@ use tokio_util::sync::CancellationToken;
 use crate::args::normalize_extras;
 use crate::auth::authenticate_service_account;
 use crate::context::Context;
+use crate::table_renderer;
 use crate::utils::spin;
 use crate::FIREBOLT_PROTOCOL_VERSION;
 use crate::USER_AGENT;
+
+// Format bytes with appropriate unit (B, KB, MB, GB, TB)
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let bytes_f64 = bytes as f64;
+    let unit_index = (bytes_f64.log2() / 10.0).floor() as usize;
+    let unit_index = unit_index.min(UNITS.len() - 1);
+
+    let value = bytes_f64 / (1024_f64.powi(unit_index as i32));
+
+    if value >= 100.0 {
+        format!("{:.0} {}", value, UNITS[unit_index])
+    } else if value >= 10.0 {
+        format!("{:.1} {}", value, UNITS[unit_index])
+    } else {
+        format!("{:.2} {}", value, UNITS[unit_index])
+    }
+}
+
+// Format number with thousand separators
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    let mut count = 0;
+
+    for c in s.chars().rev() {
+        if count > 0 && count % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+        count += 1;
+    }
+
+    result.chars().rev().collect()
+}
+
+const INTERACTIVE_MAX_ROWS: usize = 10_000;
+const INTERACTIVE_MAX_BYTES: usize = 1_048_576; // 1 MB
+
+// Limit rows for interactive display, returning a slice and an optional truncation message.
+// Bytes are estimated as the sum of JSON string lengths across all cells in a row.
+fn apply_output_limits(rows: &[Vec<serde_json::Value>]) -> (&[Vec<serde_json::Value>], Option<String>) {
+    let mut byte_count = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        if i >= INTERACTIVE_MAX_ROWS {
+            return (
+                &rows[..i],
+                Some(format!(
+                    "Showing {} of {} rows (use \\view to see all).",
+                    format_number(i as u64),
+                    format_number(rows.len() as u64),
+                )),
+            );
+        }
+        for val in row {
+            byte_count += val.to_string().len();
+        }
+        if byte_count > INTERACTIVE_MAX_BYTES {
+            return (
+                &rows[..=i],
+                Some(format!(
+                    "Showing {} of {} rows (use \\view to see all).",
+                    format_number((i + 1) as u64),
+                    format_number(rows.len() as u64),
+                )),
+            );
+        }
+    }
+    (rows, None)
+}
 
 // Set parameters via query
 pub fn set_args(context: &mut Context, query: &str) -> Result<bool, Box<dyn std::error::Error>> {
@@ -196,7 +272,109 @@ pub async fn query(context: &mut Context, query_text: String) -> Result<(), Box<
                     let body = resp.text().await?;
 
                     // on stdout, on purpose
-                    print!("{}", body);
+                    if context.args.should_render_table() {
+                        match table_renderer::parse_jsonlines_compact(&body) {
+                            Ok(parsed) => {
+                                // Store result for interactive viewing
+                                context.last_result = Some(parsed.clone());
+
+                                if let Some(errors) = parsed.errors {
+                                    // Display errors
+                                    for error in errors {
+                                        eprintln!("Error: {}", error.description);
+                                    }
+                                } else if !parsed.columns.is_empty() {
+                                    // Get terminal width for intelligent display decisions
+                                    let terminal_width = terminal_size::terminal_size()
+                                        .map(|(terminal_size::Width(w), _)| w)
+                                        .unwrap_or(80);
+
+                                    let max_cell_length = if parsed.columns.len() == 1 {
+                                        context.args.max_cell_length * 5
+                                    } else {
+                                        context.args.max_cell_length
+                                    };
+
+                                    let (display_rows, limit_msg) = if context.is_interactive {
+                                        apply_output_limits(&parsed.rows)
+                                    } else {
+                                        (&parsed.rows[..], None)
+                                    };
+
+                                    let table_output = if context.args.is_horizontal_display() {
+                                        // Force horizontal table layout
+                                        table_renderer::render_table(&parsed.columns, display_rows, max_cell_length)
+                                    } else if context.args.is_vertical_display() {
+                                        // Force vertical two-column layout
+                                        table_renderer::render_table_vertical(&parsed.columns, display_rows, terminal_width, max_cell_length)
+                                    } else if context.args.is_auto_display() {
+                                        // Auto mode - intelligently choose display mode
+                                        if table_renderer::should_use_vertical_mode(&parsed.columns, terminal_width, context.args.min_col_width) {
+                                            if context.args.verbose {
+                                                eprintln!("Note: Using vertical display mode (table too wide for horizontal display)");
+                                            }
+                                            table_renderer::render_table_vertical(&parsed.columns, display_rows, terminal_width, max_cell_length)
+                                        } else {
+                                            table_renderer::render_table(&parsed.columns, display_rows, max_cell_length)
+                                        }
+                                    } else {
+                                        // Fallback to horizontal if format starts with client: but mode not recognized
+                                        table_renderer::render_table(&parsed.columns, display_rows, max_cell_length)
+                                    };
+
+                                    println!("{}", table_output);
+
+                                    if let Some(msg) = limit_msg {
+                                        eprintln!("{}", msg);
+                                    }
+
+                                    // Store statistics for display later (after Time)
+                                    context.last_stats = if !context.args.concise && parsed.statistics.is_some() {
+                                        parsed.statistics.as_ref().and_then(|stats| {
+                                            stats.as_object().map(|obj| {
+                                                let scanned_cache = obj.get("scanned_bytes_cache")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0);
+                                                let scanned_storage = obj.get("scanned_bytes_storage")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0);
+                                                let rows_read = obj.get("rows_read")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0);
+
+                                                let total_scanned = scanned_cache + scanned_storage;
+
+                                                // Format: "Scanned: x rows, y B (..B local, ..B remote)"
+                                                if rows_read > 0 || total_scanned > 0 {
+                                                    Some(format!(
+                                                        "Scanned: {} rows, {} ({} local, {} remote)",
+                                                        format_number(rows_read),
+                                                        format_bytes(total_scanned),
+                                                        format_bytes(scanned_cache),
+                                                        format_bytes(scanned_storage)
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
+                                            }).flatten()
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                }
+                            }
+                            Err(e) => {
+                                // Fallback to raw output on parse error
+                                if context.args.verbose {
+                                    eprintln!("Failed to parse table format: {}", e);
+                                }
+                                print!("{}", body);
+                            }
+                        }
+                    } else {
+                        // Original behavior for other formats
+                        print!("{}", body);
+                    }
 
                     if !status.is_success() {
                         query_failed = true;
@@ -215,10 +393,14 @@ pub async fn query(context: &mut Context, query_text: String) -> Result<(), Box<
             if !context.args.concise {
                 let elapsed = format!("{:?}", elapsed / 100000 * 100000);
                 eprintln!("Time: {elapsed}");
+                // Print statistics if available (from client-side rendering)
+                if let Some(stats) = &context.last_stats {
+                    eprintln!("{}", stats);
+                }
                 if let Some(request_id) = maybe_request_id {
                     eprintln!("Request Id: {request_id}");
                 }
-                eprintln!("")
+                eprintln!()
             }
         }
     };
@@ -724,6 +906,36 @@ mod tests {
 
         let input = r#"SELECT $$42;"#;
         assert!(try_split_queries(input).is_none());
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1), "1.00 B");
+        assert_eq!(format_bytes(100), "100 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(1536), "1.50 KB");
+        assert_eq!(format_bytes(10240), "10.0 KB");
+        assert_eq!(format_bytes(102400), "100 KB");
+        assert_eq!(format_bytes(1048576), "1.00 MB");
+        assert_eq!(format_bytes(1572864), "1.50 MB");
+        assert_eq!(format_bytes(10485760), "10.0 MB");
+        assert_eq!(format_bytes(104857600), "100 MB");
+        assert_eq!(format_bytes(1073741824), "1.00 GB");
+        assert_eq!(format_bytes(1099511627776), "1.00 TB");
+    }
+
+    #[test]
+    fn test_format_number() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(1), "1");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(1234), "1,234");
+        assert_eq!(format_number(123456), "123,456");
+        assert_eq!(format_number(1234567), "1,234,567");
+        assert_eq!(format_number(1234567890), "1,234,567,890");
     }
 
     #[test]
