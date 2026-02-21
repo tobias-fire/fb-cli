@@ -30,6 +30,13 @@ fn default_max_cell_length() -> usize {
     1000
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_cache_ttl() -> u64 {
+    300
+}
 
 #[derive(Clone, Debug, Options, Deserialize, Serialize)]
 pub struct Args {
@@ -117,6 +124,14 @@ pub struct Args {
     #[options(no_short, help = "Disable syntax highlighting in REPL")]
     #[serde(default)]
     pub no_color: bool,
+
+    #[options(no_short, help = "Disable auto-completion in REPL")]
+    #[serde(default)]
+    pub no_completion: bool,
+
+    #[options(no_short, help = "Schema cache TTL in seconds (default: 300)")]
+    #[serde(default = "default_cache_ttl")]
+    pub completion_cache_ttl: u64,
 
     #[options(help = "Print version")]
     #[serde(default)]
